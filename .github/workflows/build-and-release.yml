@@ -1,0 +1,177 @@
+name: Build and Release
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "**.ps1"
+      - "VERSION"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Executable and Create Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve and increment version
+        id: resolve_version
+        shell: pwsh
+        run: |
+          $versionFile = "VERSION"
+          if (-not (Test-Path -Path $versionFile)) {
+              Set-Content -Path $versionFile -Value "0.1" -NoNewline
+          }
+
+          $rawVersion = (Get-Content -Path $versionFile -Raw).Trim().TrimStart('v', 'V')
+          $currentTag = "v$rawVersion"
+
+          # Synchronize tags from remote to inspect release history
+          git fetch --tags --force
+          $tagExists = [bool](git tag -l $currentTag)
+
+          $versionChangedInPush = $false
+
+          # Detect if VERSION was explicitly modified in the trigger commits
+          if ("${{ github.event_name }}" -eq "push") {
+              $beforeSha = "${{ github.event.before }}"
+              if ($beforeSha -and $beforeSha -ne "0000000000000000000000000000000000000000") {
+                  $changedFiles = git diff --name-only $beforeSha ${{ github.sha }}
+                  if ($changedFiles -contains "VERSION") {
+                      $versionChangedInPush = $true
+                  }
+              } else {
+                  # Inspect root commit changes using --root flag
+                  $changedFiles = git diff-tree --no-commit-id --name-only -r --root HEAD
+                  if ($changedFiles -contains "VERSION") {
+                      $versionChangedInPush = $true
+                  }
+              }
+          }
+
+          # If the current version tag does not exist yet or VERSION was manually modified, retain version
+          if (-not $tagExists -or $versionChangedInPush) {
+              $targetVersion = $rawVersion
+              Write-Host "Releasing target version: $targetVersion (Tag exists: $tagExists, Modified in push: $versionChangedInPush)"
+          } else {
+              # Auto-increment minor version when previous release exists (e.g. 0.1 -> 0.2)
+              if ($rawVersion -match '^(\d+)\.(\d+)$') {
+                  $major = [int]$Matches[1]
+                  $minor = [int]$Matches[2] + 1
+                  $targetVersion = "$major.$minor"
+              } else {
+                  $targetVersion = "0.1"
+              }
+
+              Write-Host "Auto-incrementing version: $rawVersion -> $targetVersion"
+              Set-Content -Path $versionFile -Value $targetVersion -NoNewline
+
+              # Commit and push incremented version back to main
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add $versionFile
+              git commit -m "chore(release): bump version to $targetVersion [skip ci]"
+              git push origin main
+          }
+
+          $releaseTag = "v$targetVersion"
+          Write-Host "Target Version : $targetVersion"
+          Write-Host "Target Git Tag : $releaseTag"
+
+          "VERSION=$targetVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install PS2EXE Module
+        shell: pwsh
+        run: |
+          Install-Module -Name ps2exe -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Compile MEGA.ps1 to MEGA.exe
+        shell: pwsh
+        run: |
+          $peVersion = "$($env:VERSION).0.0"
+          Write-Host "Packaging MEGA.ps1 with icon and metadata (PE Version: $peVersion)..."
+
+          Invoke-PS2EXE `
+              -InputFile "MEGA.ps1" `
+              -OutputFile "MEGA.exe" `
+              -IconFile "edgerome.ico" `
+              -Title "Make Edge Google Again" `
+              -Description "Make Edge Google Again (MEGA) - Microsoft Edge Auto-Deploy & Configuration Tool" `
+              -Company "Traxton" `
+              -Product "MEGA" `
+              -Copyright "MIT License" `
+              -Version $peVersion `
+              -RequireAdmin:$false `
+              -NoConsole:$false `
+              -UNICODEEncoding:$true
+
+          if (-not (Test-Path -Path "MEGA.exe")) {
+              throw "Build Error: Compiled executable MEGA.exe was not created."
+          }
+
+      - name: Generate SHA256 Checksums
+        shell: pwsh
+        run: |
+          $targetFiles = @("MEGA.exe")
+          $hashLines = foreach ($file in $targetFiles) {
+              if (Test-Path -Path $file) {
+                  $fileHash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+                  "$fileHash  $file"
+              }
+          }
+          $hashLines | Set-Content -Path "checksums.txt" -Encoding utf8
+          Write-Host "Generated SHA256 Checksums:"
+          Get-Content -Path "checksums.txt"
+
+      - name: Create Git Tag and GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Retrieve SHA-256 hash for MEGA.exe
+          $exeHash = if (Test-Path -Path "MEGA.exe") {
+              (Get-FileHash -Path "MEGA.exe" -Algorithm SHA256).Hash.ToLower()
+          } else {
+              "N/A"
+          }
+
+          # 2. Construct release notes markdown
+          $releaseNotes = @(
+              "## Make Edge Google Again (MEGA) $env:TAG",
+              "",
+              "Automated release generated via GitHub Actions.",
+              "",
+              "### Quick Start",
+              "**Option 1: One-Line PowerShell Execution**",
+              '```powershell',
+              'irm https://raw.githubusercontent.com/notxart/MEGA/main/MEGA.ps1 | iex',
+              '```',
+              "",
+              "**Option 2: Standalone Executable**",
+              "Download and execute ``MEGA.exe`` directly on Windows 10/11.",
+              "",
+              "### SHA-256 Checksum",
+              "- ``MEGA.exe``: ``$exeHash``"
+          ) -join "`n"
+
+          $releaseNotes | Set-Content -Path "release_notes.md" -Encoding utf8
+
+          # 3. Create and push release tag on the current HEAD
+          git tag -a "$env:TAG" -m "Release $env:TAG"
+          git push origin "$env:TAG"
+
+          # 4. Publish GitHub Release with compiled binary, checksum, and custom notes
+          gh release create "$env:TAG" MEGA.exe checksums.txt `
+              --title "MEGA $env:TAG" `
+              --notes-file "release_notes.md" `
+              --generate-notes

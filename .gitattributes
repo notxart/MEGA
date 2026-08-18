@@ -1,0 +1,7 @@
+# Force CRLF for Windows PowerShell 5.1 and csc.exe compatibility
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Treat binaries as binary (no line ending conversion)
+*.ico binary
+*.exe binary
