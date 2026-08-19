@@ -36,6 +36,32 @@ param()
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Enable Virtual Terminal Processing for ANSI Escape Sequences in Console
+if (-not ('Win32.Kernel32Helper' -as [type])) {
+    try {
+        Add-Type -MemberDefinition @"
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern IntPtr GetStdHandle(int nStdHandle);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+"@ -Name "Kernel32Helper" -Namespace "Win32" -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Verbose -Message "Unable to declare Win32 helper: $($_.Exception.Message)"
+    }
+}
+
+if ('Win32.Kernel32Helper' -as [type]) {
+    $stdOutHandle = [Win32.Kernel32Helper]::GetStdHandle(-11) # STD_OUTPUT_HANDLE = -11
+    $consoleMode = 0
+    if ([Win32.Kernel32Helper]::GetConsoleMode($stdOutHandle, [ref]$consoleMode)) {
+        [Win32.Kernel32Helper]::SetConsoleMode($stdOutHandle, $consoleMode -bor 0x0004) | Out-Null # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    }
+}
+
 # Unicode Arrow Glyphs (Encoded as explicit character literals to prevent script encoding issues)
 $Script:ArrowUp    = [char]0x2191
 $Script:ArrowDown  = [char]0x2193
@@ -46,7 +72,7 @@ $Script:ArrowLeft  = [char]0x2190
 # Path Definitions (HKCU Registry Policies & Profile Storage)
 # ==============================================================================
 
-# Policy Registry Paths (HKCU - Operates entirely without Administrator privileges)
+# Policy Registry Paths (HKCU Group Policy Objects - Requires elevated privileges)
 $Script:PolicyBaseKey    = 'HKCU:\SOFTWARE\Policies\Microsoft\Edge'
 $Script:ExtensionKey     = 'HKCU:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist'
 $Script:ManagedSearchKey = 'HKCU:\SOFTWARE\Policies\Microsoft\Edge\ManagedSearchEngines'
@@ -108,6 +134,20 @@ $Script:ConfigItems = @(
 
 <#
 .SYNOPSIS
+    Checks whether the current session is running with elevated administrator privileges.
+#>
+function Test-IsAdmin {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param ()
+
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($currentUser)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+<#
+.SYNOPSIS
     Ensures that a specified registry path exists.
 #>
 function Initialize-RegistryKey {
@@ -118,7 +158,7 @@ function Initialize-RegistryKey {
     )
 
     if (-not (Test-Path -Path $Path)) {
-        New-Item -Path $Path -Force | Out-Null
+        New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
     }
 }
 
@@ -143,7 +183,7 @@ function Set-RegistryValue {
     )
 
     Initialize-RegistryKey -Path $Path
-    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force | Out-Null
+    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop | Out-Null
 }
 
 <#
@@ -241,16 +281,20 @@ function Invoke-EdgeConfiguration {
 
     $extIndex = 1
     if (Test-Path -Path $Script:ExtensionKey) {
-        Remove-Item -Path $Script:ExtensionKey -Recurse -Force | Out-Null
+        Remove-Item -Path $Script:ExtensionKey -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
     }
 
     $targetExtensions = $Script:ConfigItems | Where-Object { $_.Category -eq 'Target Extensions' }
     foreach ($item in $targetExtensions) {
         if ($item.Selected) {
-            $extensionId = $extMap[$item.Id]
-            Set-RegistryValue -Path $Script:ExtensionKey -Name "$extIndex" -Value $extensionId -Type ([Microsoft.Win32.RegistryValueKind]::String)
-            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($item.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-            $extIndex++
+            try {
+                $extensionId = $extMap[$item.Id]
+                Set-RegistryValue -Path $Script:ExtensionKey -Name "$extIndex" -Value $extensionId -Type ([Microsoft.Win32.RegistryValueKind]::String)
+                Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($item.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+                $extIndex++
+            } catch {
+                Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($item.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
+            }
         }
     }
 
@@ -346,41 +390,45 @@ function Invoke-EdgeConfiguration {
     # --------------------------------------------------------------------------
     $itemPrivacyAll = $Script:ConfigItems | Where-Object { $_.Id -eq 'SET_PRIVACY_ALL' }
     if ($itemPrivacyAll.Selected) {
-        # 4.1 Core Tracking Prevention & Performance Privacy
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'TrackingPrevention' -Value 3
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'StartupBoostEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'BackgroundModeEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'NetworkPredictionOptions' -Value 2
+        try {
+            # 4.1 Core Tracking Prevention & Performance Privacy
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'TrackingPrevention' -Value 3
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'StartupBoostEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'BackgroundModeEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'NetworkPredictionOptions' -Value 2
 
-        # 4.2 Search and Connected Experiences Elimination
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'AlternateErrorPagesEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeShoppingAssistantEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'TabServicesEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeAutomaticTabGroupingEnabled' -Value 0
+            # 4.2 Search and Connected Experiences Elimination
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'AlternateErrorPagesEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeShoppingAssistantEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'TabServicesEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeAutomaticTabGroupingEnabled' -Value 0
 
-        # 4.3 Telemetry, Diagnostics & Ad Tracking Elimination
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'DiagnosticData' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'PersonalizationReportingEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'MetricsReportingEnabled' -Value 0
+            # 4.3 Telemetry, Diagnostics & Ad Tracking Elimination
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'DiagnosticData' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'PersonalizationReportingEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'MetricsReportingEnabled' -Value 0
 
-        # 4.4 Typing Telemetry, Text Prediction & WebRTC Privacy
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'TextPredictionEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeWalletCheckoutEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'PaymentMethodQueryEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'WebRtcLocalIpHdrHandling' -Value 'disable_non_proxied_udp' -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            # 4.4 Typing Telemetry, Text Prediction & WebRTC Privacy
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'TextPredictionEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeWalletCheckoutEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'PaymentMethodQueryEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'WebRtcLocalIpHdrHandling' -Value 'disable_non_proxied_udp' -Type ([Microsoft.Win32.RegistryValueKind]::String)
 
-        # 4.5 Profile Preferences Hardening
-        if (-not $prefJson.edge.PSObject.Properties['shopping']) {
-            $prefJson.edge | Add-Member -MemberType NoteProperty -Name 'shopping' -Value ([PSCustomObject]@{})
+            # 4.5 Profile Preferences Hardening
+            if (-not $prefJson.edge.PSObject.Properties['shopping']) {
+                $prefJson.edge | Add-Member -MemberType NoteProperty -Name 'shopping' -Value ([PSCustomObject]@{})
+            }
+            $prefJson.edge.shopping | Add-Member -MemberType NoteProperty -Name 'enabled' -Value $false -Force
+
+            if (-not $prefJson.edge.PSObject.Properties['tab_organization']) {
+                $prefJson.edge | Add-Member -MemberType NoteProperty -Name 'tab_organization' -Value ([PSCustomObject]@{})
+            }
+            $prefJson.edge.tab_organization | Add-Member -MemberType NoteProperty -Name 'enabled' -Value $false -Force
+
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemPrivacyAll.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemPrivacyAll.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $prefJson.edge.shopping | Add-Member -MemberType NoteProperty -Name 'enabled' -Value $false -Force
-
-        if (-not $prefJson.edge.PSObject.Properties['tab_organization']) {
-            $prefJson.edge | Add-Member -MemberType NoteProperty -Name 'tab_organization' -Value ([PSCustomObject]@{})
-        }
-        $prefJson.edge.tab_organization | Add-Member -MemberType NoteProperty -Name 'enabled' -Value $false -Force
-
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemPrivacyAll.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
     }
 
     # --------------------------------------------------------------------------
@@ -388,37 +436,41 @@ function Invoke-EdgeConfiguration {
     # --------------------------------------------------------------------------
     $itemCopDisable = $Script:ConfigItems | Where-Object { $_.Id -eq 'COP_DISABLE' }
     if ($itemCopDisable.Selected) {
-        # Core Policy Lockdowns
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'HubsSidebarEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'AllowBrowsingWithCopilot' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'Microsoft365CopilotChatIconEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotNewTabPageEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotAddressBarSuggestionsEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotCoworkToolActionsEnabled' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotPageContext' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotCDPPageContext' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeEntraCopilotPageContext' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'ShareBrowsingHistoryWithCopilotSearchAllowed' -Value 0
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'ComposeInlineEnabled' -Value 0
+        try {
+            # Core Policy Lockdowns
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'HubsSidebarEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'AllowBrowsingWithCopilot' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'Microsoft365CopilotChatIconEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotNewTabPageEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotAddressBarSuggestionsEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotCoworkToolActionsEnabled' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotPageContext' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'CopilotCDPPageContext' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'EdgeEntraCopilotPageContext' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'ShareBrowsingHistoryWithCopilotSearchAllowed' -Value 0
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'ComposeInlineEnabled' -Value 0
 
-        # Local State Experiments Flag Injection to prevent AI sidebars
-        $experimentsList = [System.Collections.Generic.List[string]]::new([string[]]$localStateJson.browser.enabled_labs_experiments)
-        $aiFlags = @('edge-copilot-mode@2', 'edge-ntp-composer@2', 'edge-compose@2')
-        foreach ($flag in $aiFlags) {
-            if (-not $experimentsList.Contains($flag)) {
-                $experimentsList.Add($flag)
+            # Local State Experiments Flag Injection to prevent AI sidebars
+            $experimentsList = [System.Collections.Generic.List[string]]::new([string[]]$localStateJson.browser.enabled_labs_experiments)
+            $aiFlags = @('edge-copilot-mode@2', 'edge-ntp-composer@2', 'edge-compose@2')
+            foreach ($flag in $aiFlags) {
+                if (-not $experimentsList.Contains($flag)) {
+                    $experimentsList.Add($flag)
+                }
             }
-        }
-        $localStateJson.browser.enabled_labs_experiments = $experimentsList.ToArray()
+            $localStateJson.browser.enabled_labs_experiments = $experimentsList.ToArray()
 
-        # Preferences Cleanup
-        if (-not $prefJson.edge.PSObject.Properties['sidebar']) {
-            $prefJson.edge | Add-Member -MemberType NoteProperty -Name 'sidebar' -Value ([PSCustomObject]@{})
-        }
-        $prefJson.edge.sidebar | Add-Member -MemberType NoteProperty -Name 'show_copilot_button' -Value $false -Force
-        $prefJson.edge.sidebar | Add-Member -MemberType NoteProperty -Name 'show_sidebar' -Value $false -Force
+            # Preferences Cleanup
+            if (-not $prefJson.edge.PSObject.Properties['sidebar']) {
+                $prefJson.edge | Add-Member -MemberType NoteProperty -Name 'sidebar' -Value ([PSCustomObject]@{})
+            }
+            $prefJson.edge.sidebar | Add-Member -MemberType NoteProperty -Name 'show_copilot_button' -Value $false -Force
+            $prefJson.edge.sidebar | Add-Member -MemberType NoteProperty -Name 'show_sidebar' -Value $false -Force
 
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemCopDisable.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemCopDisable.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemCopDisable.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
+        }
     }
 
     # Save Modified Preferences JSON
@@ -449,97 +501,121 @@ function Invoke-EdgeConfiguration {
     $itemYtm    = $Script:ConfigItems | Where-Object { $_.Id -eq 'SRCH_YTM' }
 
     if (Test-Path -Path $Script:ManagedSearchKey) {
-        Remove-Item -Path $Script:ManagedSearchKey -Recurse -Force | Out-Null
+        Remove-Item -Path $Script:ManagedSearchKey -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
     }
 
     $engineIndex = 1
 
     # 6.1 Google (Default Engine + Redirect New Tab)
     if ($itemGoogle.Selected) {
-        Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'NewTabPageSearchBox' -Value 'redirect' -Type ([Microsoft.Win32.RegistryValueKind]::String)
+        try {
+            Set-RegistryValue -Path $Script:PolicyBaseKey -Name 'NewTabPageSearchBox' -Value 'redirect' -Type ([Microsoft.Win32.RegistryValueKind]::String)
 
-        $googleEngine = @{
-            name        = 'Google'
-            keyword     = 'google.com'
-            search_url  = 'https://www.google.com/search?q={searchTerms}'
-            suggest_url = 'https://www.google.com/complete/search?client=chrome&q={searchTerms}'
-            favicon_url = 'https://www.google.com/favicon.ico'
-            is_default  = $true
+            $googleEngine = @{
+                name        = 'Google'
+                keyword     = 'google.com'
+                search_url  = 'https://www.google.com/search?q={searchTerms}'
+                suggest_url = 'https://www.google.com/complete/search?client=chrome&q={searchTerms}'
+                favicon_url = 'https://www.google.com/favicon.ico'
+                is_default  = $true
+            }
+            $json = $googleEngine | ConvertTo-Json -Compress
+            Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemGoogle.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            $engineIndex++
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemGoogle.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $json = $googleEngine | ConvertTo-Json -Compress
-        Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemGoogle.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-        $engineIndex++
     }
 
     # 6.2 Google AI (Shortcut: gg) - Schema requires omitting is_default
     if ($itemAi.Selected) {
-        $aiEngine = @{
-            name        = 'Google AI'
-            keyword     = 'gg'
-            search_url  = 'https://www.google.com/search?udm=50&q={searchTerms}'
-            favicon_url = 'https://www.google.com/favicon.ico'
+        try {
+            $aiEngine = @{
+                name        = 'Google AI'
+                keyword     = 'gg'
+                search_url  = 'https://www.google.com/search?udm=50&q={searchTerms}'
+                favicon_url = 'https://www.google.com/favicon.ico'
+            }
+            $json = $aiEngine | ConvertTo-Json -Compress
+            Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemAi.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            $engineIndex++
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemAi.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $json = $aiEngine | ConvertTo-Json -Compress
-        Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemAi.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-        $engineIndex++
     }
 
     # 6.3 Chinese -> English (Shortcut: cte)
     if ($itemCte.Selected) {
-        $cteEngine = @{
-            name        = "Chinese $($Script:ArrowRight) English"
-            keyword     = 'cte'
-            search_url  = 'https://translate.google.com/?sl=zh-TW&tl=en&text={searchTerms}'
-            favicon_url = 'https://translate.google.com/favicon.ico'
+        try {
+            $cteEngine = @{
+                name        = "Chinese $($Script:ArrowRight) English"
+                keyword     = 'cte'
+                search_url  = 'https://translate.google.com/?sl=zh-TW&tl=en&text={searchTerms}'
+                favicon_url = 'https://translate.google.com/favicon.ico'
+            }
+            $json = $cteEngine | ConvertTo-Json -Compress
+            Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemCte.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            $engineIndex++
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemCte.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $json = $cteEngine | ConvertTo-Json -Compress
-        Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemCte.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-        $engineIndex++
     }
 
     # 6.4 English -> Chinese (Shortcut: etc)
     if ($itemEtc.Selected) {
-        $etcEngine = @{
-            name        = "English $($Script:ArrowRight) Chinese"
-            keyword     = 'etc'
-            search_url  = 'https://translate.google.com/?sl=en&tl=zh-TW&text={searchTerms}'
-            favicon_url = 'https://translate.google.com/favicon.ico'
+        try {
+            $etcEngine = @{
+                name        = "English $($Script:ArrowRight) Chinese"
+                keyword     = 'etc'
+                search_url  = 'https://translate.google.com/?sl=en&tl=zh-TW&text={searchTerms}'
+                favicon_url = 'https://translate.google.com/favicon.ico'
+            }
+            $json = $etcEngine | ConvertTo-Json -Compress
+            Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemEtc.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            $engineIndex++
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemEtc.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $json = $etcEngine | ConvertTo-Json -Compress
-        Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemEtc.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-        $engineIndex++
     }
 
     # 6.5 YouTube (Shortcut: yt)
     if ($itemYt.Selected) {
-        $ytEngine = @{
-            name        = 'YouTube'
-            keyword     = 'yt'
-            search_url  = 'https://www.youtube.com/results?search_query={searchTerms}'
-            favicon_url = 'https://www.youtube.com/favicon.ico'
+        try {
+            $ytEngine = @{
+                name        = 'YouTube'
+                keyword     = 'yt'
+                search_url  = 'https://www.youtube.com/results?search_query={searchTerms}'
+                favicon_url = 'https://www.youtube.com/favicon.ico'
+            }
+            $json = $ytEngine | ConvertTo-Json -Compress
+            Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemYt.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            $engineIndex++
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemYt.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $json = $ytEngine | ConvertTo-Json -Compress
-        Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemYt.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-        $engineIndex++
     }
 
     # 6.6 YouTube Music (Shortcut: ytm)
     if ($itemYtm.Selected) {
-        $ytmEngine = @{
-            name        = 'YouTube Music'
-            keyword     = 'ytm'
-            search_url  = 'https://music.youtube.com/search?q={searchTerms}'
-            favicon_url = 'https://music.youtube.com/favicon.ico'
+        try {
+            $ytmEngine = @{
+                name        = 'YouTube Music'
+                keyword     = 'ytm'
+                search_url  = 'https://music.youtube.com/search?q={searchTerms}'
+                favicon_url = 'https://music.youtube.com/favicon.ico'
+            }
+            $json = $ytmEngine | ConvertTo-Json -Compress
+            Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemYtm.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
+            $engineIndex++
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemYtm.Label)$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
         }
-        $json = $ytmEngine | ConvertTo-Json -Compress
-        Set-RegistryValue -Path $Script:ManagedSearchKey -Name "$engineIndex" -Value $json -Type ([Microsoft.Win32.RegistryValueKind]::String)
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)$($itemYtm.Label)$($Script:StyleReset) $($Script:StyleGreen)[OK]$($Script:StyleReset)"
-        $engineIndex++
     }
 
     # Completion Banner
@@ -588,8 +664,12 @@ function Reset-EdgePolicy {
 
     # Remove all managed Edge policies under HKCU
     if (Test-Path -Path $Script:PolicyBaseKey) {
-        Remove-Item -Path $Script:PolicyBaseKey -Recurse -Force | Out-Null
-        Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)Edge Policies Status:$($Script:StyleReset) $($Script:StyleGreen)[Cleared]$($Script:StyleReset)"
+        try {
+            Remove-Item -Path $Script:PolicyBaseKey -Recurse -Force -ErrorAction Stop | Out-Null
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)Edge Policies Status:$($Script:StyleReset) $($Script:StyleGreen)[Cleared]$($Script:StyleReset)"
+        } catch {
+            Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)Edge Policies Status:$($Script:StyleReset) $($Script:StyleRed)[Failed]$($Script:StyleReset)"
+        }
     } else {
         Write-Host "   $($Script:StyleCyan)*$($Script:StyleReset) $($Script:StyleWhite)Edge Policies Status:$($Script:StyleReset) $($Script:StyleGray)[Not Found]$($Script:StyleReset)"
     }
@@ -745,6 +825,19 @@ function Show-Menu {
 function Invoke-Main {
     [CmdletBinding()]
     param ()
+
+    # Check administrative elevation
+    if (-not (Test-IsAdmin)) {
+        if ($PSCommandPath) {
+            $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+            Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -Verb RunAs
+            exit 0
+        } else {
+            Write-Host "$($Script:StyleRed)Error: Administrative privileges are required to configure Edge Group Policies.$($Script:StyleReset)"
+            Write-Host "$($Script:StyleYellow)Please run PowerShell as Administrator and try again.$($Script:StyleReset)"
+            exit 1
+        }
+    }
 
     [Console]::CursorVisible = $false
     Clear-Host
