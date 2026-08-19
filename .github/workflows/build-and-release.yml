@@ -32,55 +32,43 @@ jobs:
               Set-Content -Path $versionFile -Value "0.1" -NoNewline
           }
 
-          $rawVersion = (Get-Content -Path $versionFile -Raw).Trim().TrimStart('v', 'V')
-          $currentTag = "v$rawVersion"
+          $rawVersionStr = (Get-Content -Path $versionFile -Raw).Trim().TrimStart('v', 'V')
+          if ($rawVersionStr -notmatch '^\d+(\.\d+)+$') {
+              $rawVersionStr = "0.1"
+          }
+          $fileVersion = [version]$rawVersionStr
 
           # Synchronize tags from remote to inspect release history
           git fetch --tags --force
-          $tagExists = [bool](git tag -l $currentTag)
 
-          $versionChangedInPush = $false
-
-          # Detect if VERSION was explicitly modified in the trigger commits
-          if ("${{ github.event_name }}" -eq "push") {
-              $beforeSha = "${{ github.event.before }}"
-              if ($beforeSha -and $beforeSha -ne "0000000000000000000000000000000000000000") {
-                  $changedFiles = git diff --name-only $beforeSha ${{ github.sha }}
-                  if ($changedFiles -contains "VERSION") {
-                      $versionChangedInPush = $true
-                  }
-              } else {
-                  # Inspect root commit changes using --root flag
-                  $changedFiles = git diff-tree --no-commit-id --name-only -r --root HEAD
-                  if ($changedFiles -contains "VERSION") {
-                      $versionChangedInPush = $true
-                  }
+          # Parse existing release tags to find the highest released version
+          $allTags = git tag -l "v*"
+          $parsedVersions = foreach ($t in $allTags) {
+              $cleanTag = $t.TrimStart('v', 'V')
+              if ($cleanTag -match '^\d+(\.\d+)+$') {
+                  [version]$cleanTag
               }
           }
 
-          # If the current version tag does not exist yet or VERSION was manually modified, retain version
-          if (-not $tagExists -or $versionChangedInPush) {
-              $targetVersion = $rawVersion
-              Write-Host "Releasing target version: $targetVersion (Tag exists: $tagExists, Modified in push: $versionChangedInPush)"
+          $latestTagVersion = if ($parsedVersions) {
+              ($parsedVersions | Sort-Object -Descending)[0]
           } else {
-              # Auto-increment minor version when previous release exists (e.g. 0.1 -> 0.2)
-              if ($rawVersion -match '^(\d+)\.(\d+)$') {
-                  $major = [int]$Matches[1]
-                  $minor = [int]$Matches[2] + 1
-                  $targetVersion = "$major.$minor"
-              } else {
-                  $targetVersion = "0.1"
-              }
+              $null
+          }
 
-              Write-Host "Auto-incrementing version: $rawVersion -> $targetVersion"
-              Set-Content -Path $versionFile -Value $targetVersion -NoNewline
-
-              # Commit and push incremented version back to main
-              git config user.name "github-actions[bot]"
-              git config user.email "github-actions[bot]@users.noreply.github.com"
-              git add $versionFile
-              git commit -m "chore(release): bump version to $targetVersion [skip ci]"
-              git push origin main
+          # Monotonic Version Resolution:
+          # If VERSION file specifies a version strictly higher than any released tag (e.g. 1.0 or 0.6), use it.
+          # Otherwise (VERSION was forgotten or set to a superseded value <= latest tag), auto-increment from latest tag.
+          if ($null -eq $latestTagVersion) {
+              $targetVersion = "$($fileVersion.Major).$($fileVersion.Minor)"
+              Write-Host "Initial repository release target version: $targetVersion"
+          } elseif ($fileVersion -gt $latestTagVersion) {
+              $targetVersion = "$($fileVersion.Major).$($fileVersion.Minor)"
+              Write-Host "Releasing explicit higher version from VERSION file: $targetVersion (Supersedes latest tag: $latestTagVersion)"
+          } else {
+              $nextMinor = $latestTagVersion.Minor + 1
+              $targetVersion = "$($latestTagVersion.Major).$nextMinor"
+              Write-Host "Auto-incrementing version to prevent collision: $targetVersion (Latest tag: $latestTagVersion, File version: $fileVersion)"
           }
 
           $releaseTag = "v$targetVersion"
@@ -111,7 +99,7 @@ jobs:
               -Product "MEGA" `
               -Copyright "MIT License" `
               -Version $peVersion `
-              -RequireAdmin:$false `
+              -RequireAdmin:$true `
               -NoConsole:$false `
               -UNICODEEncoding:$true
 
