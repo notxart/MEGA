@@ -36,6 +36,32 @@ param()
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Enable Virtual Terminal Processing for ANSI Escape Sequences in Console
+if (-not ('Win32.Kernel32Helper' -as [type])) {
+    try {
+        Add-Type -MemberDefinition @"
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern IntPtr GetStdHandle(int nStdHandle);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+"@ -Name "Kernel32Helper" -Namespace "Win32" -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Verbose -Message "Unable to declare Win32 helper: $($_.Exception.Message)"
+    }
+}
+
+if ('Win32.Kernel32Helper' -as [type]) {
+    $stdOutHandle = [Win32.Kernel32Helper]::GetStdHandle(-11) # STD_OUTPUT_HANDLE = -11
+    $consoleMode = 0
+    if ([Win32.Kernel32Helper]::GetConsoleMode($stdOutHandle, [ref]$consoleMode)) {
+        [Win32.Kernel32Helper]::SetConsoleMode($stdOutHandle, $consoleMode -bor 0x0004) | Out-Null # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    }
+}
+
 # Unicode Arrow Glyphs (Encoded as explicit character literals to prevent script encoding issues)
 $Script:ArrowUp    = [char]0x2191
 $Script:ArrowDown  = [char]0x2193
