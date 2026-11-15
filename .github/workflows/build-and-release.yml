@@ -6,15 +6,21 @@ on:
     paths:
       - "**.ps1"
       - "VERSION"
+      - ".github/workflows/build-and-release.yml"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-and-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
     name: Build Executable and Create Release
     runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -23,10 +29,43 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Validate PowerShell 7 syntax and regression checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scriptPath = Join-Path $PWD.Path 'MEGA.ps1'
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                  Write-Host "::error file=MEGA.ps1,line=$($_.Extent.StartLineNumber)::$($_.Message)"
+              }
+              throw 'MEGA.ps1 contains syntax errors.'
+          }
+          & (Join-Path $PWD.Path 'tests\Test-MEGA.ps1')
+
+      - name: Validate Windows PowerShell 5.1 compatibility
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scriptPath = Join-Path (Get-Location).Path 'MEGA.ps1'
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                  Write-Host "::error file=MEGA.ps1,line=$($_.Extent.StartLineNumber)::$($_.Message)"
+              }
+              throw 'MEGA.ps1 contains syntax errors.'
+          }
+          & (Join-Path (Get-Location).Path 'tests\Test-MEGA.ps1')
+
       - name: Resolve and increment version
         id: resolve_version
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $versionFile = "VERSION"
           if (-not (Test-Path -Path $versionFile)) {
               Set-Content -Path $versionFile -Value "0.1" -NoNewline
@@ -34,60 +73,71 @@ jobs:
 
           $rawVersionStr = (Get-Content -Path $versionFile -Raw).Trim().TrimStart('v', 'V')
           if ($rawVersionStr -notmatch '^\d+(\.\d+)+$') {
+              Write-Warning "Invalid VERSION value '$rawVersionStr'; falling back to 0.1."
               $rawVersionStr = "0.1"
           }
           $fileVersion = [version]$rawVersionStr
+          $fileMinorVersion = [version]::new($fileVersion.Major, $fileVersion.Minor)
 
-          # Synchronize tags from remote to inspect release history
+          # Synchronize tags from remote so version resolution sees every release.
           git fetch --tags --force
+          if ($LASTEXITCODE -ne 0) {
+              throw "git fetch --tags failed with exit code $LASTEXITCODE."
+          }
 
-          # Parse existing release tags to find the highest released version
-          $allTags = git tag -l "v*"
-          $parsedVersions = foreach ($t in $allTags) {
-              $cleanTag = $t.TrimStart('v', 'V')
+          $parsedVersions = foreach ($tag in @(git tag -l "v*")) {
+              $cleanTag = $tag.TrimStart('v', 'V')
               if ($cleanTag -match '^\d+(\.\d+)+$') {
                   [version]$cleanTag
               }
           }
 
           $latestTagVersion = if ($parsedVersions) {
-              ($parsedVersions | Sort-Object -Descending)[0]
+              @($parsedVersions | Sort-Object -Descending)[0]
           } else {
               $null
           }
 
-          # Monotonic Version Resolution:
-          # If VERSION file specifies a version strictly higher than any released tag (e.g. 1.0 or 0.6), use it.
-          # Otherwise (VERSION was forgotten or set to a superseded value <= latest tag), auto-increment from latest tag.
-          if ($null -eq $latestTagVersion) {
-              $targetVersion = "$($fileVersion.Major).$($fileVersion.Minor)"
-              Write-Host "Initial repository release target version: $targetVersion"
-          } elseif ($fileVersion -gt $latestTagVersion) {
-              $targetVersion = "$($fileVersion.Major).$($fileVersion.Minor)"
-              Write-Host "Releasing explicit higher version from VERSION file: $targetVersion (Supersedes latest tag: $latestTagVersion)"
+          # Release tags are Major.Minor. A VERSION file with a patch component is
+          # normalized to Major.Minor, then compared against the latest tag.
+          if ($null -eq $latestTagVersion -or $fileMinorVersion -gt $latestTagVersion) {
+              $targetVersion = "$($fileMinorVersion.Major).$($fileMinorVersion.Minor)"
           } else {
-              $nextMinor = $latestTagVersion.Minor + 1
-              $targetVersion = "$($latestTagVersion.Major).$nextMinor"
-              Write-Host "Auto-incrementing version to prevent collision: $targetVersion (Latest tag: $latestTagVersion, File version: $fileVersion)"
+              $targetVersion = "$($latestTagVersion.Major).$($latestTagVersion.Minor + 1)"
           }
 
           $releaseTag = "v$targetVersion"
+          # git tag --list exits 0 even when there is no match, avoiding a
+          # stale non-zero $LASTEXITCODE at the end of this step.
+          if (git tag --list "$releaseTag") {
+              throw "Release tag $releaseTag already exists."
+          }
+
+          $peParts = @($targetVersion.Split('.'))
+          while ($peParts.Count -lt 4) {
+              $peParts += '0'
+          }
+          $peVersion = ($peParts[0..3] -join '.')
+
           Write-Host "Target Version : $targetVersion"
           Write-Host "Target Git Tag : $releaseTag"
+          Write-Host "PE Version     : $peVersion"
 
           "VERSION=$targetVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PE_VERSION=$peVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install PS2EXE Module
         shell: pwsh
         run: |
-          Install-Module -Name ps2exe -Scope CurrentUser -Force -SkipPublisherCheck
+          $ErrorActionPreference = 'Stop'
+          Install-Module -Name ps2exe -Scope CurrentUser -Repository PSGallery -Force -SkipPublisherCheck
 
       - name: Compile MEGA.ps1 to MEGA.exe
         shell: pwsh
         run: |
-          $peVersion = "$($env:VERSION).0.0"
-          Write-Host "Packaging MEGA.ps1 with icon and metadata (PE Version: $peVersion)..."
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Packaging MEGA.ps1 with icon and metadata (PE Version: $env:PE_VERSION)..."
 
           Invoke-PS2EXE `
               -InputFile "MEGA.ps1" `
@@ -98,8 +148,7 @@ jobs:
               -Company "Traxton" `
               -Product "MEGA" `
               -Copyright "MIT License" `
-              -Version $peVersion `
-              -RequireAdmin:$true `
+              -Version $env:PE_VERSION `
               -NoConsole:$false `
               -UNICODEEncoding:$true
 
@@ -110,8 +159,8 @@ jobs:
       - name: Generate SHA256 Checksums
         shell: pwsh
         run: |
-          $targetFiles = @("MEGA.exe")
-          $hashLines = foreach ($file in $targetFiles) {
+          $ErrorActionPreference = 'Stop'
+          $hashLines = foreach ($file in @("MEGA.exe")) {
               if (Test-Path -Path $file) {
                   $fileHash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
                   "$fileHash  $file"
@@ -126,14 +175,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Retrieve SHA-256 hash for MEGA.exe
+          $ErrorActionPreference = 'Stop'
+
           $exeHash = if (Test-Path -Path "MEGA.exe") {
               (Get-FileHash -Path "MEGA.exe" -Algorithm SHA256).Hash.ToLower()
           } else {
               "N/A"
           }
 
-          # 2. Construct release notes markdown
           $releaseNotes = @(
               "## Make Edge Google Again (MEGA) $env:TAG",
               "",
@@ -148,18 +197,31 @@ jobs:
               "**Option 2: Standalone Executable**",
               "Download and execute ``MEGA.exe`` directly on Windows 10/11.",
               "",
+              "No administrator privileges are required for normal use. MEGA requests UAC automatically when the HKCU Edge policy key is not writable and the current account is a local administrator.",
+              "",
               "### SHA-256 Checksum",
               "- ``MEGA.exe``: ``$exeHash``"
           ) -join "`n"
 
           $releaseNotes | Set-Content -Path "release_notes.md" -Encoding utf8
 
-          # 3. Create and push release tag on the current HEAD
-          git tag -a "$env:TAG" -m "Release $env:TAG"
-          git push origin "$env:TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 4. Publish GitHub Release with compiled binary, checksum, and custom notes
+          git tag -a "$env:TAG" -m "Release $env:TAG"
+          if ($LASTEXITCODE -ne 0) {
+              throw "git tag failed with exit code $LASTEXITCODE."
+          }
+
+          git push origin "$env:TAG"
+          if ($LASTEXITCODE -ne 0) {
+              throw "git push failed with exit code $LASTEXITCODE."
+          }
+
           gh release create "$env:TAG" MEGA.exe checksums.txt `
               --title "MEGA $env:TAG" `
               --notes-file "release_notes.md" `
               --generate-notes
+          if ($LASTEXITCODE -ne 0) {
+              throw "gh release create failed with exit code $LASTEXITCODE."
+          }
