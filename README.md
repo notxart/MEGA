@@ -19,15 +19,25 @@
 
 ### Option 1: One-Line PowerShell Execution (Recommended)
 
-Run PowerShell as a standard user (no Administrator privileges required) and paste:
+Run PowerShell as a standard user and paste:
 
 ```powershell
 irm https://raw.githubusercontent.com/notxart/MEGA/main/MEGA.ps1 | iex
 ```
 
+No Administrator privileges are normally required: every policy is written under
+`HKCU`, and the Edge profile lives under `%LOCALAPPDATA%`. MEGA checks that the
+policy key is writable before it starts. If Windows or an organization has
+locked that key, MEGA requests UAC and relaunches itself automatically when the
+current account is a local administrator, instead of failing halfway through. A
+standard account gets an explicit explanation rather than an elevation that
+would write to a different user's `HKCU`.
+
 ### Option 2: Standalone Executable (.exe)
 
 Download the latest compiled release (`MEGA.exe`) directly from the [GitHub Releases](https://github.com/notxart/MEGA/releases) page.
+
+> **Save your work first.** MEGA closes Microsoft Edge before it writes profile files.
 
 ## ✨ Features
 
@@ -36,11 +46,11 @@ Download the latest compiled release (`MEGA.exe`) directly from the [GitHub Rele
 - Sets Google as the immutable default search provider.
 - Redirects the New Tab Page search bar to Google.
 - Custom quick-search keyword engines:
-  - `gg` $\rightarrow$ Google AI Overview Search
-  - `cte` $\rightarrow$ Google Translate (Chinese $\rightarrow$ English)
-  - `etc` $\rightarrow$ Google Translate (English $\rightarrow$ Chinese)
+  - `gg` → Google AI Overview Search
+  - `cte` → Google Translate (Chinese → English)
+  - `etc` → Google Translate (English → Chinese)
   - `yt` → YouTube
-  - `ytm` $\rightarrow$ YouTube Music
+  - `ytm` → YouTube Music
 
 ### Privacy Hardening & Debloat
 
@@ -57,14 +67,23 @@ Download the latest compiled release (`MEGA.exe`) directly from the [GitHub Rele
 
 ### Essential Extension Auto-Deployment
 
+MEGA uses Edge's `ExtensionInstallForcelist` policy to install:
+
 - **uBlock Origin** (Ad-blocking)
 - **SponsorBlock** (Skip sponsored segments in YouTube)
 - **Zotero Connector** (Academic reference management)
+- **[FluentRead](https://microsoftedge.microsoft.com/addons/detail/fluentread/kakgmllfpjldjhcnkghpplmlbnmcoflp)** (Open-source immersive translation)
 
-### Zero-Risk & Non-Invasive
+### Safe by Default
 
-- Operates strictly under HKCU (Current User) — No Admin rights needed.
-- One-key complete rollback (`[R] Reset All`) to restore native Edge defaults.
+- Operates under `HKCU` and your Edge profile — no machine-wide policy changes.
+- Asks for UAC only when the policy registry key is actually not writable, or
+  when you pass `-Elevate` on an administrator account.
+- `[R] Reset All` removes every MEGA-managed policy and Copilot experiment flag,
+  and leaves unrelated Edge policies untouched. Profile preferences changed by
+  MEGA (vertical tabs, new-tab layout, languages) are left in place and can be
+  adjusted in Edge Settings.
+- Applying with no items selected is a no-op, and a corrupt Edge `Preferences` file aborts the run before anything is overwritten.
 
 ## 🎮 Interactive Menu Controls
 
@@ -79,6 +98,19 @@ MEGA features an interactive Terminal User Interface (TUI) with dynamic viewport
 | `Enter` | Apply selected configurations |
 | `R` | Reset and remove all managed policies (Revert) |
 | `Q` | Exit setup |
+
+## 🛠️ Requirements & Notes
+
+- Windows 10 or Windows 11, Microsoft Edge installed.
+- Windows PowerShell 5.1 or PowerShell 7+.
+- `-Elevate` forces a UAC prompt on an administrator account even when the policy
+  key is writable:
+
+  ```powershell
+  .\MEGA.ps1 -Elevate
+  ```
+
+- When MEGA runs through the `irm ... | iex` one-liner and needs elevation, it downloads the canonical script again into a temporary file for the elevated session. Run the script from a local file if you need to test unpublished changes.
 
 ## 📄 License
 
